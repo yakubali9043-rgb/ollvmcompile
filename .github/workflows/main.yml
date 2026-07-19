@@ -58,8 +58,19 @@ jobs:
       - name: Replace NDK clang binaries
         run: |
           install_dir=ndk/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin
+          build_bin=llvm-project/build/bin
           mkdir -p "$install_dir"
-          cp -f llvm-project/build/bin/clang llvm-project/build/bin/clang++ llvm-project/build/bin/clang-17 llvm-project/build/bin/clang++-17 "$install_dir"
+          cp -f "$build_bin/clang" "$build_bin/clang++" "$install_dir"
+          if [ -e "$build_bin/clang-17" ]; then
+            cp -f "$build_bin/clang-17" "$install_dir"
+          else
+            ln -sf clang "$install_dir/clang-17"
+          fi
+          if [ -e "$build_bin/clang++-17" ]; then
+            cp -f "$build_bin/clang++-17" "$install_dir"
+          else
+            ln -sf clang++ "$install_dir/clang++-17"
+          fi
 
       - name: Verify built OLLVM clang
         run: |
