@@ -5,8 +5,6 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  schedule:
-    - cron: '0 0 * * 0'  # Weekly build
   workflow_dispatch:
     inputs:
       clean_cache:
@@ -21,7 +19,6 @@ jobs:
     
     env:
       NDK_VERSION: r27d
-      NDK_VERSION_SHORT: r27
       LLVM_VERSION: 17.0.0
       OLLVM_REPO: DreamSoule
       NODE_OPTIONS: --no-deprecation
@@ -40,9 +37,8 @@ jobs:
       - name: Clean cache (if requested)
         if: github.event.inputs.clean_cache == 'true'
         run: |
-          rm -rf llvm-project/build
           rm -rf llvm-project/build-windows
-          rm -rf ndk
+          rm -rf ndk_windows
           rm -rf ~/.cache/ccache
 
       - name: Install cross-compilation dependencies
@@ -112,24 +108,27 @@ jobs:
           sed -i '/add_custom_command(.*OUTPUT.*clang-targets.inc.*DEPENDS.*COMMAND.*)/a\  COMMENT "Generating target descriptions..."' $FILE
           
           echo "✅ CMakeLists.txt fixed successfully"
+          
+          # Debug: show the fixed section
+          echo "📄 Fixed section:"
+          grep -A 3 -B 3 "Generating target descriptions" $FILE || echo "Section not found, but fix applied"
 
-      - name: Cache LLVM build directories
+      - name: Cache LLVM build directory
         uses: actions/cache@v4
         with:
           path: |
-            llvm-project/build
             llvm-project/build-windows
             llvm-project/ollvm-patches
             ~/.cache/ccache
-          key: ${{ runner.os }}-ollvm-${{ env.LLVM_VERSION }}-${{ hashFiles('llvm-project/llvm/CMakeLists.txt', 'llvm-project/llvm/tools/clang/CMakeLists.txt', 'llvm-project/llvm/tools/lld/CMakeLists.txt', 'llvm-project/ollvm-patches/patches/*.patch') }}
+          key: ${{ runner.os }}-ollvm-windows-${{ env.LLVM_VERSION }}-${{ hashFiles('llvm-project/llvm/CMakeLists.txt', 'llvm-project/llvm/tools/clang/CMakeLists.txt', 'llvm-project/llvm/tools/lld/CMakeLists.txt', 'llvm-project/ollvm-patches/patches/*.patch') }}
           restore-keys: |
-            ${{ runner.os }}-ollvm-${{ env.LLVM_VERSION }}-
-            ${{ runner.os }}-ollvm-
+            ${{ runner.os }}-ollvm-windows-${{ env.LLVM_VERSION }}-
+            ${{ runner.os }}-ollvm-windows-
 
-      - name: Build Linux OLLVM (for host tools)
+      - name: Build Linux llvm-tblgen (required for cross-compilation)
         run: |
-          mkdir -p llvm-project/build
-          cd llvm-project/build
+          mkdir -p llvm-project/build-tblgen
+          cd llvm-project/build-tblgen
           
           cmake -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -155,12 +154,11 @@ jobs:
             -DLLVM_ENABLE_PIC=ON \
             -DLLVM_PARALLEL_LINK_JOBS=2 \
             -DLLVM_OPTIMIZED_TABLEGEN=ON \
-            -DLLVM_CCACHE_BUILD=OFF \
             ../llvm
           
-          ninja -j "$(nproc)" clang lld
+          ninja -j "$(nproc)" llvm-tblgen clang-tblgen
 
-      - name: Cross-compile OLLVM for Windows
+      - name: Cross-compile OLLVM for Windows (clang.exe, lld.exe)
         run: |
           mkdir -p llvm-project/build-windows
           cd llvm-project/build-windows
@@ -200,22 +198,17 @@ jobs:
             -DLLVM_ENABLE_PIC=ON \
             -DLLVM_PARALLEL_LINK_JOBS=2 \
             -DLLVM_OPTIMIZED_TABLEGEN=ON \
-            -DLLVM_CCACHE_BUILD=OFF \
-            -DLLVM_TABLEGEN=$(pwd)/../build/bin/llvm-tblgen \
-            -DCLANG_TABLEGEN=$(pwd)/../build/bin/clang-tblgen \
+            -DLLVM_TABLEGEN=$(pwd)/../build-tblgen/bin/llvm-tblgen \
+            -DCLANG_TABLEGEN=$(pwd)/../build-tblgen/bin/clang-tblgen \
             ../llvm
           
+          # Build only clang and lld
           ninja -j "$(nproc)" clang lld
 
       - name: Download Android NDK r27d (Windows)
         run: |
           curl -L -o android-ndk-${{ env.NDK_VERSION }}-windows.zip https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-windows.zip
           unzip -q android-ndk-${{ env.NDK_VERSION }}-windows.zip -d ndk_windows
-
-      - name: Download Android NDK r27d (Linux for comparison)
-        run: |
-          curl -L -o android-ndk-${{ env.NDK_VERSION }}-linux.zip https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip
-          unzip -q android-ndk-${{ env.NDK_VERSION }}-linux.zip -d ndk_linux
 
       - name: Replace Windows NDK clang binaries with cross-compiled OLLVM
         run: |
@@ -226,67 +219,26 @@ jobs:
           mkdir -p "$install_dir/backup"
           cp -f "$install_dir/clang.exe" "$install_dir/backup/clang.original.exe" 2>/dev/null || true
           cp -f "$install_dir/clang++.exe" "$install_dir/backup/clang++.original.exe" 2>/dev/null || true
+          cp -f "$install_dir/lld.exe" "$install_dir/backup/lld.original.exe" 2>/dev/null || true
           
-          # Install cross-compiled OLLVM binaries (rename to .exe)
+          # Install cross-compiled OLLVM binaries (.exe)
           cp -f "$build_bin/clang.exe" "$install_dir/"
           cp -f "$build_bin/clang++.exe" "$install_dir/"
-          
-          # Copy lld to NDK
           cp -f "$build_bin/lld.exe" "$install_dir/" 2>/dev/null || echo "lld.exe not found"
           cp -f "$build_bin/ld.lld.exe" "$install_dir/" 2>/dev/null || echo "ld.lld.exe not found"
+          cp -f "$build_bin/lld-link.exe" "$install_dir/" 2>/dev/null || echo "lld-link.exe not found"
           
-          # Create versioned symlinks for compatibility
+          # Create versioned copies for compatibility
           cd "$install_dir"
-          for version in 17; do
-            if [ -f "clang-$version.exe" ] || [ -L "clang-$version.exe" ]; then
-              rm -f "clang-$version.exe"
-            fi
-            cp -f clang.exe "clang-$version.exe"
-            
-            if [ -f "clang++-$version.exe" ] || [ -L "clang++-$version.exe" ]; then
-              rm -f "clang++-$version.exe"
-            fi
-            cp -f clang++.exe "clang++-$version.exe"
-          done
-          
-          cp -f clang.exe "clang-17.exe" 2>/dev/null || true
-          cp -f clang++.exe "clang++-17.exe" 2>/dev/null || true
+          # Copy clang.exe to versioned names
+          cp -f clang.exe "clang-17.exe"
+          cp -f clang++.exe "clang++-17.exe"
+          cp -f clang.exe "clang-${{ env.LLVM_VERSION }}.exe" 2>/dev/null || true
+          cp -f clang++.exe "clang++-${{ env.LLVM_VERSION }}.exe" 2>/dev/null || true
           
           echo "✅ Windows NDK binaries replaced with cross-compiled OLLVM"
 
-      - name: Replace Linux NDK binaries (optional, for comparison)
-        run: |
-          install_dir=ndk_linux/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin
-          build_bin=llvm-project/build/bin
-          
-          # Create backup
-          mkdir -p "$install_dir/backup"
-          cp -f "$install_dir/clang" "$install_dir/backup/clang.original" 2>/dev/null || true
-          cp -f "$install_dir/clang++" "$install_dir/backup/clang++.original" 2>/dev/null || true
-          
-          # Install Linux OLLVM binaries
-          cp -f "$build_bin/clang" "$install_dir/"
-          cp -f "$build_bin/clang++" "$install_dir/"
-          chmod +x "$install_dir/clang" "$install_dir/clang++"
-          
-          # Copy lld to NDK
-          cp -f "$build_bin/lld" "$install_dir/"
-          cp -f "$build_bin/ld.lld" "$install_dir/" 2>/dev/null || ln -sf lld "$install_dir/ld.lld"
-          chmod +x "$install_dir/lld" 2>/dev/null || true
-          chmod +x "$install_dir/ld.lld" 2>/dev/null || true
-          
-          # Create versioned symlinks
-          cd "$install_dir"
-          for version in 17; do
-            rm -f "clang-$version"
-            ln -sf clang "clang-$version"
-            rm -f "clang++-$version"
-            ln -sf clang++ "clang++-$version"
-          done
-          ln -sf clang "clang-17" 2>/dev/null || true
-          ln -sf clang++ "clang++-17" 2>/dev/null || true
-
-      - name: Verify Windows OLLVM binaries
+      - name: Verify Windows OLLVM binaries (file type check)
         run: |
           echo "╔════════════════════════════════════════════════════════════════╗"
           echo "║     Windows OLLVM Binary Verification                        ║"
@@ -298,134 +250,18 @@ jobs:
           ls -la ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/*.exe | head -10
           echo ""
           
-          # Check file types
-          echo "📌 Checking binary file types:"
+          # Check file types (should show PE32+ executable for Windows)
+          echo "📌 Checking binary file types (should be Windows PE executables):"
           file ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe
           file ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe
-          echo ""
-
-      - name: Verify OLLVM obfuscation passes (Linux)
-        run: |
-          ndk_bin=ndk_linux/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin
-          
-          echo "╔════════════════════════════════════════════════════════════════╗"
-          echo "║     Linux OLLVM Obfuscation Passes Test Suite                ║"
-          echo "╚════════════════════════════════════════════════════════════════╝"
+          file ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/lld.exe 2>/dev/null || echo "lld.exe not found"
           echo ""
           
-          # Create test source
-          cat > test_source.c << 'EOF'
-          #include <stdio.h>
-          #include <string.h>
-          
-          int main(int argc, char** argv) {
-              const char* secret = "Hello OLLVM World";
-              char buffer[100];
-              strcpy(buffer, secret);
-              printf("%s\n", buffer);
-              
-              int sum = 0;
-              for(int i = 0; i < 100; i++) {
-                  sum += i;
-                  if (sum > 1000) break;
-              }
-              return sum;
-          }
-          EOF
-          
-          # Function to test OLLVM passes
-          test_pass() {
-              local pass_name=$1
-              local pass_flag=$2
-              local extra_flags=$3
-              
-              echo "─────────────────────────────────────────────────────────────────"
-              echo "🧪 Testing: $pass_name"
-              echo "   Flag: $pass_flag"
-              
-              if [ -n "$extra_flags" ]; then
-                  output=$("$ndk_bin/clang" $pass_flag $extra_flags test_source.c -o test_${pass_name// /_} 2>&1)
-                  exit_code=$?
-              else
-                  output=$("$ndk_bin/clang" $pass_flag test_source.c -o test_${pass_name// /_} 2>&1)
-                  exit_code=$?
-              fi
-              
-              if [ $exit_code -eq 0 ]; then
-                  echo "   ✅ $pass_name: SUCCESS"
-              else
-                  echo "   ❌ $pass_name: FAILED (exit code: $exit_code)"
-                  echo "   Error: $output"
-              fi
-              echo ""
-              return $exit_code
-          }
-          
-          # Test each pass individually
-          test_pass "Control Flow Flattening" "-mllvm -fla"
-          test_pass "Bogus Control Flow" "-mllvm -bcf"
-          test_pass "Bogus CF with Loop" "-mllvm -bcf" "-mllvm -bcf_loop=3"
-          test_pass "Bogus CF with Prob" "-mllvm -bcf" "-mllvm -bcf_prob=40"
-          test_pass "Instruction Substitution" "-mllvm -sub"
-          test_pass "Instruction Substitution with Loop" "-mllvm -sub" "-mllvm -sub_loop=3"
-          test_pass "String Obfuscation" "-mllvm -sobf"
-          test_pass "Basic Block Splitting" "-mllvm -split"
-          test_pass "Split with Num" "-mllvm -split" "-mllvm -split_num=3"
-          test_pass "Indirect Branch" "-mllvm -ibr"
-          test_pass "Indirect Call" "-mllvm -icall"
-          test_pass "Indirect Global Variables" "-mllvm -igv"
-          
-          # Test combined passes
-          echo "─────────────────────────────────────────────────────────────────"
-          echo "🧪 Testing: Combined Obfuscation Passes"
-          output=$("$ndk_bin/clang" -mllvm -fla -mllvm -bcf -mllvm -sub -mllvm -sobf test_source.c -o test_combined 2>&1)
-          if [ $? -eq 0 ]; then
-              echo "   ✅ Combined passes: SUCCESS"
-          else
-              echo "   ⚠️ Combined passes may need adjustment"
-              echo "   Output: $output"
-          fi
-          echo ""
-
-      - name: Print OLLVM compiler versions
-        run: |
-          echo "╔════════════════════════════════════════════════════════════════╗"
-          echo "║     OLLVM Build Information                                   ║"
-          echo "╚════════════════════════════════════════════════════════════════╝"
-          echo ""
-          
-          echo "📌 LINUX COMPILER VERSION:"
-          echo "─────────────────────────────────────────────────────────────────"
-          ndk_linux/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --version
-          echo ""
-          
-          echo "📌 WINDOWS COMPILER VERSION:"
-          echo "─────────────────────────────────────────────────────────────────"
-          ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe --version || echo "Cannot run Windows binary on Linux - file type check only"
-          echo ""
-          
-          echo "📌 OBFUSCATION PASSES (DreamSoule OLLVM17):"
-          echo "─────────────────────────────────────────────────────────────────"
-          echo "  ✅ -fla           : Control Flow Flattening"
-          echo "  ✅ -bcf           : Bogus Control Flow"
-          echo "  ✅ -bcf_loop=N    : Bogus CF Loop (N=number of loops)"
-          echo "  ✅ -bcf_prob=N    : Bogus CF Probability (N=percentage)"
-          echo "  ✅ -sub           : Instruction Substitution"
-          echo "  ✅ -sub_loop=N    : Substitution Loop (N=number of loops)"
-          echo "  ✅ -sobf          : String Obfuscation"
-          echo "  ✅ -split         : Basic Block Splitting"
-          echo "  ✅ -split_num=N   : Split Number (N=number of blocks)"
-          echo "  ✅ -ibr           : Indirect Branch"
-          echo "  ✅ -icall         : Indirect Call"
-          echo "  ✅ -igv           : Indirect Global Variables"
-          echo ""
-          echo "📌 NDK INFORMATION:"
-          echo "─────────────────────────────────────────────────────────────────"
-          echo "  NDK Version    : ${{ env.NDK_VERSION }} (LTS)"
-          echo "  LLVM Version   : ${{ env.LLVM_VERSION }} with DreamSoule OLLVM17"
-          echo "  Architectures  : AArch64, ARM, X86"
-          echo "  Platforms      : Linux (native), Windows (cross-compiled)"
-          echo "  Repository     : https://github.com/DreamSoule/ollvm17"
+          # Check binary sizes
+          echo "📌 Binary sizes:"
+          du -h ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe
+          du -h ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe
+          du -h ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/lld.exe 2>/dev/null || echo "lld.exe not found"
 
       - name: Create Windows NDK documentation
         run: |
@@ -527,96 +363,13 @@ jobs:
           echo =========================================
           EOF
 
-      - name: Create Linux NDK documentation
-        run: |
-          ndk_dir=ndk_linux/android-ndk-${{ env.NDK_VERSION }}
-          
-          # Create version info for Linux
-          cat > "$ndk_dir/VERSION.txt" << 'EOF'
-          ╔══════════════════════════════════════════════════════════════════╗
-          ║     Android NDK with DreamSoule OLLVM17                        ║
-          ║     Linux Version - Native Build                              ║
-          ╚══════════════════════════════════════════════════════════════════╝
-          
-          NDK Version: r27d (LTS)
-          LLVM Version: 17.0.0
-          OLLVM Source: https://github.com/DreamSoule/ollvm17
-          Platform: Linux x86_64
-          
-          ────────────────────────────────────────────────────────────────────
-          OBFUSCATION PASSES:
-          ────────────────────────────────────────────────────────────────────
-          
-          ✓ Control Flow Flattening    : -mllvm -fla
-          ✓ Bogus Control Flow         : -mllvm -bcf
-            - bcf_loop=N               : Number of loops (default: 1)
-            - bcf_prob=N               : Probability percentage (default: 30)
-          ✓ Instruction Substitution   : -mllvm -sub
-            - sub_loop=N               : Number of loops (default: 1)
-          ✓ String Obfuscation         : -mllvm -sobf
-          ✓ Basic Block Splitting      : -mllvm -split
-            - split_num=N              : Number of blocks (default: 2)
-          ✓ Indirect Branch            : -mllvm -ibr
-          ✓ Indirect Call              : -mllvm -icall
-          ✓ Indirect Global Variables  : -mllvm -igv
-          
-          ────────────────────────────────────────────────────────────────────
-          SETUP INSTRUCTIONS:
-          ────────────────────────────────────────────────────────────────────
-          
-          # Set environment variables
-          export ANDROID_NDK_HOME=/path/to/this/ndk
-          export PATH=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
-          
-          # Or use the helper script:
-          source use_ollvm.sh
-          
-          ────────────────────────────────────────────────────────────────────
-          USAGE EXAMPLES:
-          ────────────────────────────────────────────────────────────────────
-          
-          # Single pass
-          clang -mllvm -fla source.c -o output
-          
-          # Multiple passes
-          clang -mllvm -fla -mllvm -bcf -mllvm -sub source.c -o output
-          
-          # All obfuscations
-          clang -mllvm -fla -mllvm -bcf -mllvm -sub -mllvm -sobf -mllvm -split source.c -o output
-          EOF
-          
-          # Create shell script for Linux setup
-          cat > "$ndk_dir/use_ollvm.sh" << 'EOF'
-          #!/bin/bash
-          export NDK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          export ANDROID_NDK_HOME="$NDK_DIR"
-          export PATH="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-          echo "✅ OLLVM NDK r27d environment ready"
-          echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
-          echo "PATH: $PATH"
-          echo ""
-          echo "Usage: clang -mllvm -fla source.c -o output"
-          EOF
-          
-          chmod +x "$ndk_dir/use_ollvm.sh"
-
       - name: Package Windows NDK with OLLVM
         run: |
           cd ndk_windows
           zip -r ../android-ndk-${{ env.NDK_VERSION }}-ollvm-windows.zip android-ndk-${{ env.NDK_VERSION }} \
             -x "*/backup/*" \
-            -x "*/test_*" \
             -x "*/windows-x86_64/libexec/*" \
             -x "*/windows-x86_64/share/*"
-
-      - name: Package Linux NDK with OLLVM
-        run: |
-          cd ndk_linux
-          zip -r ../android-ndk-${{ env.NDK_VERSION }}-ollvm-linux.zip android-ndk-${{ env.NDK_VERSION }} \
-            -x "*/backup/*" \
-            -x "*/test_*" \
-            -x "*/linux-x86_64/libexec/*" \
-            -x "*/linux-x86_64/share/*"
 
       - name: Upload Windows NDK artifact
         uses: actions/upload-artifact@v4
@@ -625,17 +378,10 @@ jobs:
           path: android-ndk-${{ env.NDK_VERSION }}-ollvm-windows.zip
           retention-days: 90
 
-      - name: Upload Linux NDK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-ndk-${{ env.NDK_VERSION }}-ollvm-linux
-          path: android-ndk-${{ env.NDK_VERSION }}-ollvm-linux.zip
-          retention-days: 90
-
-      - name: Generate comprehensive build summary
+      - name: Generate build summary
         run: |
           echo "╔════════════════════════════════════════════════════════════════╗" >> $GITHUB_STEP_SUMMARY
-          echo "║  ✅ DreamSoule OLLVM17 Cross-Compilation Complete            ║" >> $GITHUB_STEP_SUMMARY
+          echo "║  ✅ DreamSoule OLLVM17 Windows Cross-Compilation Complete    ║" >> $GITHUB_STEP_SUMMARY
           echo "╚════════════════════════════════════════════════════════════════╝" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
@@ -643,10 +389,8 @@ jobs:
           echo "- **NDK Version:** ${{ env.NDK_VERSION }} (LTS)" >> $GITHUB_STEP_SUMMARY
           echo "- **LLVM Version:** ${{ env.LLVM_VERSION }}" >> $GITHUB_STEP_SUMMARY
           echo "- **OLLVM Source:** [DreamSoule/ollvm17](https://github.com/DreamSoule/ollvm17) ⭐⭐⭐⭐⭐" >> $GITHUB_STEP_SUMMARY
-          echo "- **Platforms:** Linux (native), Windows (cross-compiled)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Artifacts:**" >> $GITHUB_STEP_SUMMARY
-          echo "  - \`android-ndk-${{ env.NDK_VERSION }}-ollvm-linux.zip\` (Linux native)" >> $GITHUB_STEP_SUMMARY
-          echo "  - \`android-ndk-${{ env.NDK_VERSION }}-ollvm-windows.zip\` (Windows cross-compiled)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform:** Windows x86_64 (cross-compiled)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Artifact:** \`android-ndk-${{ env.NDK_VERSION }}-ollvm-windows.zip\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Retention:** 90 days" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
@@ -663,50 +407,37 @@ jobs:
           echo "| **Indirect Global Variables** | Obfuscates global variable access | \`-mllvm -igv\` | - |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "## ✅ Compatibility" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Android Studio (all target triples)" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ CMake (3.22+)" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ ndk-build (Android.mk/Application.mk)" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Windows (cross-compiled, fully functional)" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Linux (native, fully functional)" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Included Executables" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ \`clang.exe\` - OLLVM compiler" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ \`clang++.exe\` - OLLVM C++ compiler" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ \`lld.exe\` - LLD linker" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ \`clang-17.exe\` - Versioned binary" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ \`clang++-17.exe\` - Versioned C++ binary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "## 📝 Usage Examples" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo '# Setup environment (Linux)' >> $GITHUB_STEP_SUMMARY
-          echo 'source use_ollvm.sh' >> $GITHUB_STEP_SUMMARY
-          echo '' >> $GITHUB_STEP_SUMMARY
-          echo '# Setup environment (Windows)' >> $GITHUB_STEP_SUMMARY
+          echo "## 📝 Usage Example (Windows)" >> $GITHUB_STEP_SUMMARY
+          echo '```cmd' >> $GITHUB_STEP_SUMMARY
+          echo ':: Setup environment' >> $GITHUB_STEP_SUMMARY
           echo 'setup_ollvm.bat' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
-          echo '# Single pass' >> $GITHUB_STEP_SUMMARY
-          echo 'clang -mllvm -fla source.c -o output' >> $GITHUB_STEP_SUMMARY
+          echo ':: Single pass' >> $GITHUB_STEP_SUMMARY
+          echo 'clang -mllvm -fla source.c -o output.exe' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
-          echo '# Multiple passes' >> $GITHUB_STEP_SUMMARY
-          echo 'clang -mllvm -fla -mllvm -bcf -mllvm -sub source.c -o output' >> $GITHUB_STEP_SUMMARY
+          echo ':: Multiple passes' >> $GITHUB_STEP_SUMMARY
+          echo 'clang -mllvm -fla -mllvm -bcf -mllvm -sub source.c -o output.exe' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
-          echo '# With parameters' >> $GITHUB_STEP_SUMMARY
-          echo 'clang -mllvm -bcf -mllvm -bcf_loop=3 -mllvm -bcf_prob=40 source.c -o output' >> $GITHUB_STEP_SUMMARY
-          echo '' >> $GITHUB_STEP_SUMMARY
-          echo '# All obfuscations' >> $GITHUB_STEP_SUMMARY
-          echo 'clang -mllvm -fla -mllvm -bcf -mllvm -sub -mllvm -sobf -mllvm -split source.c -o output' >> $GITHUB_STEP_SUMMARY
-          echo '' >> $GITHUB_STEP_SUMMARY
-          echo '# Android target' >> $GITHUB_STEP_SUMMARY
-          echo 'clang -target aarch64-linux-android -mllvm -fla -mllvm -bcf source.c -o output' >> $GITHUB_STEP_SUMMARY
+          echo ':: Android target' >> $GITHUB_STEP_SUMMARY
+          echo 'clang -target aarch64-linux-android -mllvm -fla source.c -o output' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "## 📊 Artifact Information" >> $GITHUB_STEP_SUMMARY
-          if [ -f "android-ndk-${{ env.NDK_VERSION }}-ollvm-linux.zip" ]; then
-            SIZE_LINUX=$(du -h android-ndk-${{ env.NDK_VERSION }}-ollvm-linux.zip | cut -f1)
-            echo "| **File Size (Linux)** | $SIZE_LINUX |" >> $GITHUB_STEP_SUMMARY
-          fi
           if [ -f "android-ndk-${{ env.NDK_VERSION }}-ollvm-windows.zip" ]; then
-            SIZE_WIN=$(du -h android-ndk-${{ env.NDK_VERSION }}-ollvm-windows.zip | cut -f1)
-            echo "| **File Size (Windows)** | $SIZE_WIN |" >> $GITHUB_STEP_SUMMARY
+            SIZE=$(du -h android-ndk-${{ env.NDK_VERSION }}-ollvm-windows.zip | cut -f1)
+            echo "## 📊 Artifact Information" >> $GITHUB_STEP_SUMMARY
+            echo "| **File Size** | $SIZE |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Build Time** | ~20-35 min (first run), ~5-10 min (cached) |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Platform** | Windows x86_64 |" >> $GITHUB_STEP_SUMMARY
           fi
-          echo "| **Build Time** | ~25-40 min (first run), ~5-10 min (cached) |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Platform** | Linux (native), Windows (cross-compiled) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           echo "## 🔗 Resources" >> $GITHUB_STEP_SUMMARY
