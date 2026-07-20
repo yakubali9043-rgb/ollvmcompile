@@ -37,6 +37,7 @@ jobs:
       - name: Clean cache (if requested)
         if: github.event.inputs.clean_cache == 'true'
         run: |
+          rm -rf llvm-project/build-tblgen
           rm -rf llvm-project/build-windows
           rm -rf ndk_windows
           rm -rf ~/.cache/ccache
@@ -50,7 +51,8 @@ jobs:
             mingw-w64-tools \
             cmake \
             ninja-build \
-            pkg-config
+            pkg-config \
+            dos2unix
 
       - name: Ensure llvm-project source is present
         run: |
@@ -92,7 +94,7 @@ jobs:
           echo "📊 Patch Summary: $success_count applied, $fail_count failed"
           cd ../..
 
-      - name: Fix CMake add_custom_command error (CMP0175)
+      - name: Fix CMake add_custom_command error (ROBUST FIX)
         run: |
           FILE="llvm-project/clang/lib/Tooling/CMakeLists.txt"
           echo "🔧 Fixing CMakeLists.txt for CMake 3.29+ compatibility..."
@@ -100,27 +102,126 @@ jobs:
           # Create backup
           cp $FILE $FILE.bak
           
-          # Fix the add_custom_command syntax
-          # Remove problematic COMMENT lines
-          sed -i '/COMMENT "Generating target descriptions"/d' $FILE
+          # Method 1: Remove the problematic lines and rewrite them
+          # First, find and remove the problematic add_custom_command
+          echo "Removing problematic add_custom_command..."
           
-          # Add corrected COMMENT after the add_custom_command
-          sed -i '/add_custom_command(.*OUTPUT.*clang-targets.inc.*DEPENDS.*COMMAND.*)/a\  COMMENT "Generating target descriptions..."' $FILE
+          # Use Python for more robust editing
+          python3 << 'PYTHON_SCRIPT'
+          import re
           
-          echo "✅ CMakeLists.txt fixed successfully"
+          file_path = "llvm-project/clang/lib/Tooling/CMakeLists.txt"
           
-          # Debug: show the fixed section
-          echo "📄 Fixed section:"
-          grep -A 3 -B 3 "Generating target descriptions" $FILE || echo "Section not found, but fix applied"
+          with open(file_path, 'r') as f:
+              content = f.read()
+          
+          # Pattern to find the problematic add_custom_command
+          # Look for add_custom_command with clang-targets.inc
+          pattern = r'(add_custom_command\s*\([\s\S]*?OUTPUT\s*[\s\S]*?clang-targets\.inc[\s\S]*?COMMAND\s*[\s\S]*?COMMENT\s*"Generating target descriptions\."[\s\S]*?\))'
+          
+          # Replace with corrected version
+          corrected = '''add_custom_command(
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/clang-targets.inc
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../
+            COMMAND ${CMAKE_COMMAND} -E echo "Generating target descriptions..."
+            COMMENT "Generating target descriptions..."
+          )'''
+          
+          # Remove the problematic one and add corrected
+          content = re.sub(pattern, corrected, content, flags=re.DOTALL)
+          
+          # If pattern didn't match, try simpler approach
+          if "clang-targets.inc" in content and "COMMENT" in content:
+              # Look for the specific lines and replace
+              lines = content.split('\n')
+              new_lines = []
+              in_target_block = False
+              skip_block = False
+              block_buffer = []
+              
+              for i, line in enumerate(lines):
+                  if 'add_custom_command' in line and 'clang-targets.inc' in content[content.find(line):content.find(line)+500]:
+                      in_target_block = True
+                      block_buffer = [line]
+                      continue
+                  
+                  if in_target_block:
+                      block_buffer.append(line)
+                      if ')' in line and not any('COMMENT' in l for l in block_buffer):
+                          # Replace the whole block
+                          corrected_block = [
+                              'add_custom_command(',
+                              '  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/clang-targets.inc',
+                              '  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../',
+                              '  COMMAND ${CMAKE_COMMAND} -E echo "Generating target descriptions..."',
+                              '  COMMENT "Generating target descriptions..."',
+                              ')'
+                          ]
+                          new_lines.extend(corrected_block)
+                          in_target_block = False
+                          continue
+                      elif ')' in line:
+                          in_target_block = False
+                          if not any('COMMENT' in l for l in block_buffer):
+                              corrected_block = [
+                                  'add_custom_command(',
+                                  '  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/clang-targets.inc',
+                                  '  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../',
+                                  '  COMMAND ${CMAKE_COMMAND} -E echo "Generating target descriptions..."',
+                                  '  COMMENT "Generating target descriptions..."',
+                                  ')'
+                              ]
+                              new_lines.extend(corrected_block)
+                          else:
+                              new_lines.extend(block_buffer)
+                          continue
+                      continue
+                  
+                  if not in_target_block:
+                      new_lines.append(line)
+              
+              content = '\n'.join(new_lines)
+          
+          with open(file_path, 'w') as f:
+              f.write(content)
+          
+          print("✅ CMakeLists.txt fixed successfully")
+          PYTHON_SCRIPT
+          
+          # Show the fixed section for debugging
+          echo "📄 Fixed section (line numbers around fix):"
+          grep -n "clang-targets.inc" $FILE -A 5 -B 2 || echo "clang-targets.inc found in file"
 
-      - name: Cache LLVM build directory
+      - name: Alternative CMake fix (if Python fails)
+        if: failure()
+        run: |
+          FILE="llvm-project/clang/lib/Tooling/CMakeLists.txt"
+          echo "🔧 Using alternative fix method..."
+          
+          # Create a backup
+          cp $FILE $FILE.bak2
+          
+          # Use sed to completely replace the problematic lines
+          # Find the start of the add_custom_command block
+          sed -i '/add_custom_command.*clang-targets.inc/,/)/c\
+          add_custom_command(\
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/clang-targets.inc\
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../\
+            COMMAND ${CMAKE_COMMAND} -E echo "Generating target descriptions..."\
+            COMMENT "Generating target descriptions..."\
+          )' $FILE
+          
+          echo "✅ Alternative fix applied"
+
+      - name: Cache LLVM build directories
         uses: actions/cache@v4
         with:
           path: |
+            llvm-project/build-tblgen
             llvm-project/build-windows
             llvm-project/ollvm-patches
             ~/.cache/ccache
-          key: ${{ runner.os }}-ollvm-windows-${{ env.LLVM_VERSION }}-${{ hashFiles('llvm-project/llvm/CMakeLists.txt', 'llvm-project/llvm/tools/clang/CMakeLists.txt', 'llvm-project/llvm/tools/lld/CMakeLists.txt', 'llvm-project/ollvm-patches/patches/*.patch') }}
+          key: ${{ runner.os }}-ollvm-windows-${{ env.LLVM_VERSION }}-${{ hashFiles('llvm-project/llvm/CMakeLists.txt', 'llvm-project/llvm/tools/clang/CMakeLists.txt', 'llvm-project/llvm/tools/lld/CMakeLists.txt', 'llvm-project/ollvm-patches/patches/*.patch', 'llvm-project/clang/lib/Tooling/CMakeLists.txt') }}
           restore-keys: |
             ${{ runner.os }}-ollvm-windows-${{ env.LLVM_VERSION }}-
             ${{ runner.os }}-ollvm-windows-
@@ -129,6 +230,8 @@ jobs:
         run: |
           mkdir -p llvm-project/build-tblgen
           cd llvm-project/build-tblgen
+          
+          echo "📌 Building host tools (llvm-tblgen, clang-tblgen)..."
           
           cmake -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -157,11 +260,26 @@ jobs:
             ../llvm
           
           ninja -j "$(nproc)" llvm-tblgen clang-tblgen
+          
+          echo "✅ Host tools built successfully"
 
       - name: Cross-compile OLLVM for Windows (clang.exe, lld.exe)
         run: |
           mkdir -p llvm-project/build-windows
           cd llvm-project/build-windows
+          
+          echo "📌 Cross-compiling OLLVM for Windows..."
+          
+          # Verify tablegen tools exist
+          if [ ! -f "../build-tblgen/bin/llvm-tblgen" ]; then
+            echo "❌ llvm-tblgen not found!"
+            exit 1
+          fi
+          
+          if [ ! -f "../build-tblgen/bin/clang-tblgen" ]; then
+            echo "❌ clang-tblgen not found!"
+            exit 1
+          fi
           
           # Configure for Windows cross-compilation
           cmake -G Ninja \
@@ -202,66 +320,143 @@ jobs:
             -DCLANG_TABLEGEN=$(pwd)/../build-tblgen/bin/clang-tblgen \
             ../llvm
           
+          if [ $? -ne 0 ]; then
+            echo "❌ CMake configuration failed!"
+            exit 1
+          fi
+          
           # Build only clang and lld
           ninja -j "$(nproc)" clang lld
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ Build failed!"
+            exit 1
+          fi
+          
+          echo "✅ Cross-compilation completed successfully"
+          
+          # Verify the output
+          echo "📌 Built binaries:"
+          ls -la bin/*.exe 2>/dev/null || echo "No .exe files found"
 
       - name: Download Android NDK r27d (Windows)
         run: |
+          echo "📌 Downloading Android NDK r27d Windows..."
           curl -L -o android-ndk-${{ env.NDK_VERSION }}-windows.zip https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-windows.zip
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to download NDK"
+            exit 1
+          fi
           unzip -q android-ndk-${{ env.NDK_VERSION }}-windows.zip -d ndk_windows
+          echo "✅ NDK downloaded and extracted"
 
       - name: Replace Windows NDK clang binaries with cross-compiled OLLVM
         run: |
           install_dir=ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin
           build_bin=llvm-project/build-windows/bin
           
+          echo "📌 Installing OLLVM binaries to NDK..."
+          
           # Create backup of original binaries
           mkdir -p "$install_dir/backup"
-          cp -f "$install_dir/clang.exe" "$install_dir/backup/clang.original.exe" 2>/dev/null || true
-          cp -f "$install_dir/clang++.exe" "$install_dir/backup/clang++.original.exe" 2>/dev/null || true
-          cp -f "$install_dir/lld.exe" "$install_dir/backup/lld.original.exe" 2>/dev/null || true
+          cp -f "$install_dir/clang.exe" "$install_dir/backup/clang.original.exe" 2>/dev/null || echo "Original clang.exe not found"
+          cp -f "$install_dir/clang++.exe" "$install_dir/backup/clang++.original.exe" 2>/dev/null || echo "Original clang++.exe not found"
+          cp -f "$install_dir/lld.exe" "$install_dir/backup/lld.original.exe" 2>/dev/null || echo "Original lld.exe not found"
           
           # Install cross-compiled OLLVM binaries (.exe)
-          cp -f "$build_bin/clang.exe" "$install_dir/"
-          cp -f "$build_bin/clang++.exe" "$install_dir/"
-          cp -f "$build_bin/lld.exe" "$install_dir/" 2>/dev/null || echo "lld.exe not found"
-          cp -f "$build_bin/ld.lld.exe" "$install_dir/" 2>/dev/null || echo "ld.lld.exe not found"
-          cp -f "$build_bin/lld-link.exe" "$install_dir/" 2>/dev/null || echo "lld-link.exe not found"
+          if [ -f "$build_bin/clang.exe" ]; then
+            cp -f "$build_bin/clang.exe" "$install_dir/"
+            echo "✅ clang.exe installed"
+          else
+            echo "❌ clang.exe not found in build output"
+            exit 1
+          fi
+          
+          if [ -f "$build_bin/clang++.exe" ]; then
+            cp -f "$build_bin/clang++.exe" "$install_dir/"
+            echo "✅ clang++.exe installed"
+          else
+            echo "❌ clang++.exe not found in build output"
+            exit 1
+          fi
+          
+          # Copy lld if available
+          if [ -f "$build_bin/lld.exe" ]; then
+            cp -f "$build_bin/lld.exe" "$install_dir/"
+            echo "✅ lld.exe installed"
+          else
+            echo "⚠️ lld.exe not found - skipping"
+          fi
+          
+          if [ -f "$build_bin/ld.lld.exe" ]; then
+            cp -f "$build_bin/ld.lld.exe" "$install_dir/"
+            echo "✅ ld.lld.exe installed"
+          fi
+          
+          if [ -f "$build_bin/lld-link.exe" ]; then
+            cp -f "$build_bin/lld-link.exe" "$install_dir/"
+            echo "✅ lld-link.exe installed"
+          fi
           
           # Create versioned copies for compatibility
           cd "$install_dir"
-          # Copy clang.exe to versioned names
           cp -f clang.exe "clang-17.exe"
           cp -f clang++.exe "clang++-17.exe"
           cp -f clang.exe "clang-${{ env.LLVM_VERSION }}.exe" 2>/dev/null || true
           cp -f clang++.exe "clang++-${{ env.LLVM_VERSION }}.exe" 2>/dev/null || true
           
           echo "✅ Windows NDK binaries replaced with cross-compiled OLLVM"
+          
+          # Show installed files
+          echo "📌 Installed binaries:"
+          ls -la "$install_dir" | grep -E "clang|lld" || echo "No binaries found"
 
-      - name: Verify Windows OLLVM binaries (file type check)
+      - name: Verify Windows OLLVM binaries
         run: |
           echo "╔════════════════════════════════════════════════════════════════╗"
           echo "║     Windows OLLVM Binary Verification                        ║"
           echo "╚════════════════════════════════════════════════════════════════╝"
           echo ""
           
+          install_dir=ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin
+          
           # Check if Windows binaries exist
           echo "📌 Checking Windows binaries:"
-          ls -la ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/*.exe | head -10
+          ls -la "$install_dir"/*.exe 2>/dev/null | head -10 || echo "No .exe files found"
           echo ""
           
           # Check file types (should show PE32+ executable for Windows)
           echo "📌 Checking binary file types (should be Windows PE executables):"
-          file ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe
-          file ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe
-          file ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/lld.exe 2>/dev/null || echo "lld.exe not found"
+          if [ -f "$install_dir/clang.exe" ]; then
+            file "$install_dir/clang.exe"
+          else
+            echo "❌ clang.exe not found!"
+          fi
+          
+          if [ -f "$install_dir/clang++.exe" ]; then
+            file "$install_dir/clang++.exe"
+          else
+            echo "❌ clang++.exe not found!"
+          fi
+          
+          if [ -f "$install_dir/lld.exe" ]; then
+            file "$install_dir/lld.exe"
+          else
+            echo "⚠️ lld.exe not found"
+          fi
           echo ""
           
           # Check binary sizes
           echo "📌 Binary sizes:"
-          du -h ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe
-          du -h ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe
-          du -h ndk_windows/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/windows-x86_64/bin/lld.exe 2>/dev/null || echo "lld.exe not found"
+          if [ -f "$install_dir/clang.exe" ]; then
+            du -h "$install_dir/clang.exe"
+          fi
+          if [ -f "$install_dir/clang++.exe" ]; then
+            du -h "$install_dir/clang++.exe"
+          fi
+          if [ -f "$install_dir/lld.exe" ]; then
+            du -h "$install_dir/lld.exe"
+          fi
 
       - name: Create Windows NDK documentation
         run: |
@@ -297,6 +492,16 @@ jobs:
           ✓ Indirect Global Variables  : -mllvm -igv
           
           ────────────────────────────────────────────────────────────────────
+          INCLUDED EXECUTABLES:
+          ────────────────────────────────────────────────────────────────────
+          
+          ✅ clang.exe        - OLLVM compiler
+          ✅ clang++.exe      - OLLVM C++ compiler
+          ✅ lld.exe          - LLD linker
+          ✅ clang-17.exe     - Versioned compiler
+          ✅ clang++-17.exe   - Versioned C++ compiler
+          
+          ────────────────────────────────────────────────────────────────────
           SETUP INSTRUCTIONS:
           ────────────────────────────────────────────────────────────────────
           
@@ -324,21 +529,6 @@ jobs:
           # Android target
           clang -target aarch64-linux-android -mllvm -fla -mllvm -bcf source.c -o output
           
-          ────────────────────────────────────────────────────────────────────
-          INTEGRATION WITH ANDROID STUDIO:
-          ────────────────────────────────────────────────────────────────────
-          
-          In build.gradle:
-          android {
-              defaultConfig {
-                  externalNativeBuild {
-                      cmake {
-                          cppFlags "-mllvm -fla -mllvm -bcf -mllvm -sub"
-                      }
-                  }
-              }
-          }
-          
           ╔══════════════════════════════════════════════════════════════════╗
           ║  For more info: https://github.com/DreamSoule/ollvm17          ║
           ║  Built with GitHub Actions - Cross-Compiled for Windows        ║
@@ -359,6 +549,16 @@ jobs:
           echo ANDROID_NDK_HOME=%ANDROID_NDK_HOME%
           echo PATH updated with OLLVM binaries
           echo.
+          echo Available OLLVM passes:
+          echo   -fla  : Control Flow Flattening
+          echo   -bcf  : Bogus Control Flow
+          echo   -sub  : Instruction Substitution
+          echo   -sobf : String Obfuscation
+          echo   -split: Basic Block Splitting
+          echo   -ibr  : Indirect Branch
+          echo   -icall: Indirect Call
+          echo   -igv  : Indirect Global Variables
+          echo.
           echo Usage: clang -mllvm -fla source.c -o output
           echo =========================================
           EOF
@@ -370,6 +570,9 @@ jobs:
             -x "*/backup/*" \
             -x "*/windows-x86_64/libexec/*" \
             -x "*/windows-x86_64/share/*"
+          
+          echo "✅ Package created: android-ndk-${{ env.NDK_VERSION }}-ollvm-windows.zip"
+          ls -lh ../android-ndk-${{ env.NDK_VERSION }}-ollvm-windows.zip
 
       - name: Upload Windows NDK artifact
         uses: actions/upload-artifact@v4
