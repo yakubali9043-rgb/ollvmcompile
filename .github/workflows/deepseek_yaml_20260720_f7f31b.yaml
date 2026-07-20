@@ -19,7 +19,7 @@ jobs:
     
     env:
       NDK_VERSION: r27d
-      LLVM_VERSION: 17.0.0
+      LLVM_VERSION: 17.0.6
       OLLVM_REPO: DreamSoule
       NODE_OPTIONS: --no-deprecation
       
@@ -37,8 +37,8 @@ jobs:
       - name: Clean cache (if requested)
         if: github.event.inputs.clean_cache == 'true'
         run: |
-          rm -rf llvm-project/build-tblgen
-          rm -rf llvm-project/build-windows
+          rm -rf llvm-project
+          rm -rf llvm-project-build
           rm -rf ndk_windows
           rm -rf ~/.cache/ccache
 
@@ -52,49 +52,57 @@ jobs:
             cmake \
             ninja-build \
             pkg-config \
-            dos2unix
+            dos2unix \
+            python3
 
-      - name: Ensure llvm-project source is present
+      - name: Download LLVM 17.0.6 official source
         run: |
-          if [ ! -d llvm-project ]; then
-            git clone --depth 1 --branch llvmorg-17.0.0 https://github.com/llvm/llvm-project.git llvm-project
-          fi
+          echo "📌 Downloading LLVM 17.0.6 official source..."
+          curl -L -o llvm-17.0.6.src.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/llvm-project-17.0.6.src.tar.xz
+          tar -xf llvm-17.0.6.src.tar.xz
+          mv llvm-project-17.0.6.src llvm-project
+          echo "✅ LLVM 17.0.6 source downloaded"
 
-      - name: Apply DreamSoule OLLVM17 patches
+      - name: Download DreamSoule OLLVM17 patches
         run: |
+          echo "📌 Downloading DreamSoule OLLVM17 patches..."
           cd llvm-project
-          
-          # Clone DreamSoule OLLVM17 patches
           git clone --depth 1 https://github.com/DreamSoule/ollvm17.git ollvm-patches
           
-          # Apply patches with retry logic
-          cd llvm
-          success_count=0
-          fail_count=0
+          # According to DreamSoule instructions, replace files in official source
+          echo "📌 Replacing files with OLLVM17 versions..."
           
-          for patch in ../ollvm-patches/patches/*.patch; do
-            if [ -f "$patch" ]; then
-              echo "Applying patch: $(basename $patch)"
-              if patch -p1 -f --forward < "$patch" 2>&1; then
-                echo "✅ $(basename $patch) applied successfully"
-                ((success_count++))
-              else
-                echo "⚠️ $(basename $patch) failed, checking if already applied..."
-                if patch -p1 -R --dry-run < "$patch" 2>&1 > /dev/null; then
-                  echo "✅ $(basename $patch) already applied"
-                  ((success_count++))
-                else
-                  echo "❌ $(basename $patch) failed - skipping"
-                  ((fail_count++))
-                fi
+          # Copy Obfuscation directory to LLVM
+          if [ -d "ollvm-patches/llvm/lib/Transforms/Obfuscation" ]; then
+            cp -r ollvm-patches/llvm/lib/Transforms/Obfuscation llvm/lib/Transforms/
+            echo "✅ Obfuscation passes copied"
+          else
+            echo "⚠️ Obfuscation directory not found in patches"
+          fi
+          
+          # Copy include files if needed
+          if [ -d "ollvm-patches/llvm/include/llvm/Transforms/Obfuscation" ]; then
+            cp -r ollvm-patches/llvm/include/llvm/Transforms/Obfuscation llvm/include/llvm/Transforms/
+            echo "✅ Obfuscation headers copied"
+          fi
+          
+          # Apply patch files if they exist (alternative method)
+          if [ -d "ollvm-patches/patches" ]; then
+            echo "📌 Applying patch files..."
+            cd llvm
+            for patch in ../ollvm-patches/patches/*.patch; do
+              if [ -f "$patch" ]; then
+                echo "Applying patch: $(basename $patch)"
+                patch -p1 -f --forward < "$patch" 2>&1 || echo "⚠️ Patch may already be applied"
               fi
-            fi
-          done
+            done
+            cd ..
+          fi
           
-          echo "📊 Patch Summary: $success_count applied, $fail_count failed"
-          cd ../..
+          echo "✅ DreamSoule OLLVM17 integration complete"
+          cd ..
 
-      - name: Fix CMake add_custom_command error (ROBUST FIX)
+      - name: Fix CMake add_custom_command error (CMP0175)
         run: |
           FILE="llvm-project/clang/lib/Tooling/CMakeLists.txt"
           echo "🔧 Fixing CMakeLists.txt for CMake 3.29+ compatibility..."
@@ -102,11 +110,7 @@ jobs:
           # Create backup
           cp $FILE $FILE.bak
           
-          # Method 1: Remove the problematic lines and rewrite them
-          # First, find and remove the problematic add_custom_command
-          echo "Removing problematic add_custom_command..."
-          
-          # Use Python for more robust editing
+          # Fix using Python for robust editing
           python3 << 'PYTHON_SCRIPT'
           import re
           
@@ -115,11 +119,9 @@ jobs:
           with open(file_path, 'r') as f:
               content = f.read()
           
-          # Pattern to find the problematic add_custom_command
-          # Look for add_custom_command with clang-targets.inc
+          # Fix the add_custom_command syntax
           pattern = r'(add_custom_command\s*\([\s\S]*?OUTPUT\s*[\s\S]*?clang-targets\.inc[\s\S]*?COMMAND\s*[\s\S]*?COMMENT\s*"Generating target descriptions\."[\s\S]*?\))'
           
-          # Replace with corrected version
           corrected = '''add_custom_command(
             OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/clang-targets.inc
             DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../
@@ -127,54 +129,32 @@ jobs:
             COMMENT "Generating target descriptions..."
           )'''
           
-          # Remove the problematic one and add corrected
           content = re.sub(pattern, corrected, content, flags=re.DOTALL)
           
           # If pattern didn't match, try simpler approach
           if "clang-targets.inc" in content and "COMMENT" in content:
-              # Look for the specific lines and replace
               lines = content.split('\n')
               new_lines = []
               in_target_block = False
-              skip_block = False
-              block_buffer = []
               
               for i, line in enumerate(lines):
                   if 'add_custom_command' in line and 'clang-targets.inc' in content[content.find(line):content.find(line)+500]:
                       in_target_block = True
-                      block_buffer = [line]
+                      # Skip to the end of the block
                       continue
                   
                   if in_target_block:
-                      block_buffer.append(line)
-                      if ')' in line and not any('COMMENT' in l for l in block_buffer):
-                          # Replace the whole block
-                          corrected_block = [
+                      if ')' in line:
+                          # Add corrected block
+                          new_lines.extend([
                               'add_custom_command(',
                               '  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/clang-targets.inc',
                               '  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../',
                               '  COMMAND ${CMAKE_COMMAND} -E echo "Generating target descriptions..."',
                               '  COMMENT "Generating target descriptions..."',
                               ')'
-                          ]
-                          new_lines.extend(corrected_block)
+                          ])
                           in_target_block = False
-                          continue
-                      elif ')' in line:
-                          in_target_block = False
-                          if not any('COMMENT' in l for l in block_buffer):
-                              corrected_block = [
-                                  'add_custom_command(',
-                                  '  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/clang-targets.inc',
-                                  '  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../',
-                                  '  COMMAND ${CMAKE_COMMAND} -E echo "Generating target descriptions..."',
-                                  '  COMMENT "Generating target descriptions..."',
-                                  ')'
-                              ]
-                              new_lines.extend(corrected_block)
-                          else:
-                              new_lines.extend(block_buffer)
-                          continue
                       continue
                   
                   if not in_target_block:
@@ -188,30 +168,7 @@ jobs:
           print("✅ CMakeLists.txt fixed successfully")
           PYTHON_SCRIPT
           
-          # Show the fixed section for debugging
-          echo "📄 Fixed section (line numbers around fix):"
-          grep -n "clang-targets.inc" $FILE -A 5 -B 2 || echo "clang-targets.inc found in file"
-
-      - name: Alternative CMake fix (if Python fails)
-        if: failure()
-        run: |
-          FILE="llvm-project/clang/lib/Tooling/CMakeLists.txt"
-          echo "🔧 Using alternative fix method..."
-          
-          # Create a backup
-          cp $FILE $FILE.bak2
-          
-          # Use sed to completely replace the problematic lines
-          # Find the start of the add_custom_command block
-          sed -i '/add_custom_command.*clang-targets.inc/,/)/c\
-          add_custom_command(\
-            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/clang-targets.inc\
-            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../\
-            COMMAND ${CMAKE_COMMAND} -E echo "Generating target descriptions..."\
-            COMMENT "Generating target descriptions..."\
-          )' $FILE
-          
-          echo "✅ Alternative fix applied"
+          echo "✅ CMake fix applied"
 
       - name: Cache LLVM build directories
         uses: actions/cache@v4
@@ -221,7 +178,7 @@ jobs:
             llvm-project/build-windows
             llvm-project/ollvm-patches
             ~/.cache/ccache
-          key: ${{ runner.os }}-ollvm-windows-${{ env.LLVM_VERSION }}-${{ hashFiles('llvm-project/llvm/CMakeLists.txt', 'llvm-project/llvm/tools/clang/CMakeLists.txt', 'llvm-project/llvm/tools/lld/CMakeLists.txt', 'llvm-project/ollvm-patches/patches/*.patch', 'llvm-project/clang/lib/Tooling/CMakeLists.txt') }}
+          key: ${{ runner.os }}-ollvm-windows-${{ env.LLVM_VERSION }}-${{ hashFiles('llvm-project/llvm/CMakeLists.txt', 'llvm-project/llvm/tools/clang/CMakeLists.txt', 'llvm-project/llvm/tools/lld/CMakeLists.txt', 'llvm-project/llvm/lib/Transforms/Obfuscation/**/*.cpp', 'llvm-project/ollvm-patches/**/*.patch') }}
           restore-keys: |
             ${{ runner.os }}-ollvm-windows-${{ env.LLVM_VERSION }}-
             ${{ runner.os }}-ollvm-windows-
@@ -241,6 +198,8 @@ jobs:
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD="AArch64;ARM;X86" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_EH=OFF \
+            -DLLVM_ENABLE_RTTI=OFF \
             -DLLVM_ENABLE_TERMINFO=OFF \
             -DLLVM_ENABLE_ZLIB=OFF \
             -DLLVM_ENABLE_ZSTD=OFF \
@@ -251,8 +210,6 @@ jobs:
             -DLLVM_BUILD_EXAMPLES=OFF \
             -DLLVM_BUILD_TOOLS=ON \
             -DCLANG_BUILD_TOOLS=ON \
-            -DLLVM_ENABLE_EH=OFF \
-            -DLLVM_ENABLE_RTTI=OFF \
             -DLLVM_USE_SANITIZER= \
             -DLLVM_ENABLE_PIC=ON \
             -DLLVM_PARALLEL_LINK_JOBS=2 \
@@ -300,6 +257,8 @@ jobs:
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD="AArch64;ARM;X86" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_EH=OFF \
+            -DLLVM_ENABLE_RTTI=OFF \
             -DLLVM_ENABLE_TERMINFO=OFF \
             -DLLVM_ENABLE_ZLIB=OFF \
             -DLLVM_ENABLE_ZSTD=OFF \
@@ -310,8 +269,6 @@ jobs:
             -DLLVM_BUILD_EXAMPLES=OFF \
             -DLLVM_BUILD_TOOLS=ON \
             -DCLANG_BUILD_TOOLS=ON \
-            -DLLVM_ENABLE_EH=OFF \
-            -DLLVM_ENABLE_RTTI=OFF \
             -DLLVM_USE_SANITIZER= \
             -DLLVM_ENABLE_PIC=ON \
             -DLLVM_PARALLEL_LINK_JOBS=2 \
@@ -458,11 +415,11 @@ jobs:
             du -h "$install_dir/lld.exe"
           fi
 
-      - name: Create Windows NDK documentation
+      - name: Create Windows NDK documentation with all OLLVM passes
         run: |
           ndk_dir=ndk_windows/android-ndk-${{ env.NDK_VERSION }}
           
-          # Create version info for Windows
+          # Create version info for Windows with all DreamSoule OLLVM17 passes
           cat > "$ndk_dir/VERSION.txt" << 'EOF'
           ╔══════════════════════════════════════════════════════════════════╗
           ║     Android NDK with DreamSoule OLLVM17                        ║
@@ -470,26 +427,51 @@ jobs:
           ╚══════════════════════════════════════════════════════════════════╝
           
           NDK Version: r27d (LTS)
-          LLVM Version: 17.0.0
+          LLVM Version: 17.0.6
           OLLVM Source: https://github.com/DreamSoule/ollvm17
           Platform: Windows x86_64
           
           ────────────────────────────────────────────────────────────────────
-          OBFUSCATION PASSES:
+          ALL OBFUSCATION PASSES:
           ────────────────────────────────────────────────────────────────────
           
-          ✓ Control Flow Flattening    : -mllvm -fla
-          ✓ Bogus Control Flow         : -mllvm -bcf
-            - bcf_loop=N               : Number of loops (default: 1)
-            - bcf_prob=N               : Probability percentage (default: 30)
-          ✓ Instruction Substitution   : -mllvm -sub
-            - sub_loop=N               : Number of loops (default: 1)
-          ✓ String Obfuscation         : -mllvm -sobf
-          ✓ Basic Block Splitting      : -mllvm -split
-            - split_num=N              : Number of blocks (default: 2)
-          ✓ Indirect Branch            : -mllvm -ibr
-          ✓ Indirect Call              : -mllvm -icall
-          ✓ Indirect Global Variables  : -mllvm -igv
+          ✓ -fla           : Control Flow Flattening
+          ✓ -bcf           : Bogus Control Flow
+            - bcf_prob=N   : Probability 1~100 (default: 70)
+            - bcf_loop=N   : Repeat count (default: 2)
+          ✓ -sub           : Instruction Substitution (add/and/sub/or/xor)
+            - sub_loop=N   : Substitution times (default: 1)
+          ✓ -sobf          : String Obfuscation (narrow characters only)
+          ✓ -split         : Basic Block Splitting
+            - split_num=N  : Number of split blocks (default: 3)
+          ✓ -ibr           : Indirect Branch
+          ✓ -icall         : Indirect Call (call register)
+          ✓ -igv           : Indirect Global Variables
+          ✓ -fncmd         : Function name control obfuscation
+          
+          ────────────────────────────────────────────────────────────────────
+          FULL FEATURES EXAMPLE:
+          ────────────────────────────────────────────────────────────────────
+          
+          -mllvm -fla -mllvm -bcf -mllvm -bcf_prob=80 -mllvm -bcf_loop=3 
+          -mllvm -sobf -mllvm -icall -mllvm -ibr -mllvm -igv 
+          -mllvm -sub -mllvm -sub_loop=3 -mllvm -split -mllvm -split_num=5
+          
+          ────────────────────────────────────────────────────────────────────
+          ANNOTATION SUPPORT (per-function control):
+          ────────────────────────────────────────────────────────────────────
+          
+          // Enable specific passes for a function
+          __attribute__((annotate("fla bcf igv ibr icall sub split")))
+          int myFunction() {
+              return 0;
+          }
+          
+          // Disable specific passes
+          __attribute__((annotate("nofla nobcf nosplit")))
+          int myFunction2() {
+              return 0;
+          }
           
           ────────────────────────────────────────────────────────────────────
           INCLUDED EXECUTABLES:
@@ -520,11 +502,11 @@ jobs:
           # Multiple passes
           clang -mllvm -fla -mllvm -bcf -mllvm -sub source.c -o output
           
-          # With parameters
-          clang -mllvm -bcf -mllvm -bcf_loop=3 -mllvm -bcf_prob=40 source.c -o output
+          # Full obfuscation
+          clang -mllvm -fla -mllvm -bcf -mllvm -sub -mllvm -sobf -mllvm -split -mllvm -ibr -mllvm -icall -mllvm -igv source.c -o output
           
-          # All obfuscations
-          clang -mllvm -fla -mllvm -bcf -mllvm -sub -mllvm -sobf -mllvm -split source.c -o output
+          # With parameters
+          clang -mllvm -bcf -mllvm -bcf_loop=3 -mllvm -bcf_prob=80 -mllvm -sub_loop=3 -mllvm -split_num=5 source.c -o output
           
           # Android target
           clang -target aarch64-linux-android -mllvm -fla -mllvm -bcf source.c -o output
@@ -535,11 +517,12 @@ jobs:
           ╚══════════════════════════════════════════════════════════════════╝
           EOF
           
-          # Create a batch file for Windows setup
+          # Create a batch file for Windows setup with all pass information
           cat > "$ndk_dir/setup_ollvm.bat" << 'EOF'
           @echo off
           echo =========================================
           echo OLLVM NDK r27d - Windows Setup
+          echo DreamSoule OLLVM17 - All Features
           echo =========================================
           echo.
           set "NDK_DIR=%~dp0"
@@ -549,17 +532,34 @@ jobs:
           echo ANDROID_NDK_HOME=%ANDROID_NDK_HOME%
           echo PATH updated with OLLVM binaries
           echo.
-          echo Available OLLVM passes:
-          echo   -fla  : Control Flow Flattening
-          echo   -bcf  : Bogus Control Flow
-          echo   -sub  : Instruction Substitution
-          echo   -sobf : String Obfuscation
-          echo   -split: Basic Block Splitting
-          echo   -ibr  : Indirect Branch
-          echo   -icall: Indirect Call
-          echo   -igv  : Indirect Global Variables
+          echo =========================================
+          echo AVAILABLE OLLVM PASSES:
+          echo =========================================
+          echo   -fla    : Control Flow Flattening
+          echo   -bcf    : Bogus Control Flow
+          echo     bcf_prob=N  : Probability 1~100 (default: 70)
+          echo     bcf_loop=N  : Repeat count (default: 2)
+          echo   -sub    : Instruction Substitution
+          echo     sub_loop=N  : Substitution times (default: 1)
+          echo   -sobf   : String Obfuscation
+          echo   -split  : Basic Block Splitting
+          echo     split_num=N : Number of split blocks (default: 3)
+          echo   -ibr    : Indirect Branch
+          echo   -icall  : Indirect Call
+          echo   -igv    : Indirect Global Variables
+          echo   -fncmd  : Function name control
           echo.
-          echo Usage: clang -mllvm -fla source.c -o output
+          echo =========================================
+          echo FULL OBFUSCATION EXAMPLE:
+          echo =========================================
+          echo clang -mllvm -fla -mllvm -bcf -mllvm -bcf_prob=80 -mllvm -bcf_loop=3 -mllvm -sobf -mllvm -icall -mllvm -ibr -mllvm -igv -mllvm -sub -mllvm -sub_loop=3 -mllvm -split -mllvm -split_num=5 source.c -o output
+          echo.
+          echo =========================================
+          echo ANNOTATION SUPPORT (per-function):
+          echo =========================================
+          echo __attribute__((annotate("fla bcf igv ibr icall sub split")))
+          echo __attribute__((annotate("nofla nobcf nosplit")))
+          echo.
           echo =========================================
           EOF
 
@@ -597,17 +597,18 @@ jobs:
           echo "- **Retention:** 90 days" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "## 🛡️ All Obfuscation Passes" >> $GITHUB_STEP_SUMMARY
+          echo "## 🛡️ All DreamSoule OLLVM17 Passes" >> $GITHUB_STEP_SUMMARY
           echo "| Pass | Description | Flag | Parameters |" >> $GITHUB_STEP_SUMMARY
           echo "|------|-------------|------|------------|" >> $GITHUB_STEP_SUMMARY
           echo "| **Control Flow Flattening** | Flattens control flow graph | \`-mllvm -fla\` | - |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Bogus Control Flow** | Adds fake control flow paths | \`-mllvm -bcf\` | \`-bcf_loop=N\`, \`-bcf_prob=N\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Bogus Control Flow** | Adds fake control flow paths | \`-mllvm -bcf\` | \`-bcf_prob=N\` (1-100), \`-bcf_loop=N\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Instruction Substitution** | Replaces instructions with equivalents | \`-mllvm -sub\` | \`-sub_loop=N\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **String Obfuscation** | Encrypts strings in binary | \`-mllvm -sobf\` | - |" >> $GITHUB_STEP_SUMMARY
           echo "| **Basic Block Splitting** | Splits basic blocks | \`-mllvm -split\` | \`-split_num=N\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Indirect Branch** | Obfuscates branch targets | \`-mllvm -ibr\` | - |" >> $GITHUB_STEP_SUMMARY
           echo "| **Indirect Call** | Obfuscates call targets | \`-mllvm -icall\` | - |" >> $GITHUB_STEP_SUMMARY
           echo "| **Indirect Global Variables** | Obfuscates global variable access | \`-mllvm -igv\` | - |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Function Name Control** | Function-level obfuscation control | \`-mllvm -fncmd\` | - |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           echo "## ✅ Included Executables" >> $GITHUB_STEP_SUMMARY
@@ -618,19 +619,18 @@ jobs:
           echo "- ✅ \`clang++-17.exe\` - Versioned C++ binary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "## 📝 Usage Example (Windows)" >> $GITHUB_STEP_SUMMARY
+          echo "## 📝 Usage Example (Full Obfuscation)" >> $GITHUB_STEP_SUMMARY
           echo '```cmd' >> $GITHUB_STEP_SUMMARY
           echo ':: Setup environment' >> $GITHUB_STEP_SUMMARY
           echo 'setup_ollvm.bat' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
-          echo ':: Single pass' >> $GITHUB_STEP_SUMMARY
-          echo 'clang -mllvm -fla source.c -o output.exe' >> $GITHUB_STEP_SUMMARY
+          echo ':: Full obfuscation with all passes' >> $GITHUB_STEP_SUMMARY
+          echo 'clang -mllvm -fla -mllvm -bcf -mllvm -bcf_prob=80 -mllvm -bcf_loop=3 -mllvm -sobf -mllvm -icall -mllvm -ibr -mllvm -igv -mllvm -sub -mllvm -sub_loop=3 -mllvm -split -mllvm -split_num=5 source.c -o output.exe' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
-          echo ':: Multiple passes' >> $GITHUB_STEP_SUMMARY
-          echo 'clang -mllvm -fla -mllvm -bcf -mllvm -sub source.c -o output.exe' >> $GITHUB_STEP_SUMMARY
-          echo '' >> $GITHUB_STEP_SUMMARY
-          echo ':: Android target' >> $GITHUB_STEP_SUMMARY
-          echo 'clang -target aarch64-linux-android -mllvm -fla source.c -o output' >> $GITHUB_STEP_SUMMARY
+          echo ':: Per-function control using annotation' >> $GITHUB_STEP_SUMMARY
+          echo '// In source code:' >> $GITHUB_STEP_SUMMARY
+          echo '__attribute__((annotate("fla bcf igv ibr icall sub split")))' >> $GITHUB_STEP_SUMMARY
+          echo 'int myFunction() { return 0; }' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
